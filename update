@@ -28,6 +28,14 @@ switch ( $type ) {
 		die();
 }
 
+// Number of revisions to update per batch.
+$per_batch = 1000;
+if ( ! empty( $args[1] ) ) {
+	if ( 0 == $per_batch = abs( intval( $args[1] ) ) ) {
+		$per_batch = 1000;
+	}
+}
+
 echo "Determining most recent SVN revision...\r\n";
 try {
 	$changelog = @file_get_contents( 'http://plugins.trac.wordpress.org/log/?format=changelog&stop_rev=HEAD' );
@@ -52,42 +60,150 @@ if ( file_exists( $directory . '/.last-revision' ) ) {
 $start_time = time();
 
 if ( $last_revision != $svn_last_revision ) {
-	if ( $last_revision ) {
-		$changelog_url = sprintf( 'http://plugins.trac.wordpress.org/log/?verbose=on&mode=follow_copy&format=changelog&rev=%d&limit=%d', $svn_last_revision, $svn_last_revision - $last_revision );
-		$changes = file_get_contents( $changelog_url );
-		preg_match_all( '#^' . "\t" . '*\* ([^/A-Z ]+)[ /].* \((added|modified|deleted|moved|copied)\)' . "\n" . '#m', $changes, $matches );
-		$plugins = array_unique( $matches[1] );
-	} else {
+
+	// Grab plugins for a first-time pull, get the count.
+	if ( false === $last_revision ) {
 		$plugins = file_get_contents( 'http://svn.wp-plugins.org/' );
 		preg_match_all( '#<li><a href="([^/]+)/">([^/]+)/</a></li>#', $plugins, $matches );
-		$plugins = $matches[1];
+		$total_plugins = $matches[1];
 	}
 
-	foreach ( $plugins as $plugin ) {
-		$plugin = urldecode( $plugin );
-		echo "Updating " . $plugin;
+	// Make copies of the original revision numbers for updating based on revision number.
+	$temp_last_revision     = $last_revision;
+	$temp_svn_last_revision = $svn_last_revision;
 
-		$output = null; $return = null;
-		exec( 'wget -q -np -O ' . escapeshellarg( sprintf($download, $plugin) ) . ' ' . escapeshellarg( sprintf($url, $plugin) ) . ' > /dev/null', $output, $return );
+	// For first-time slurps, the difference is the total number of plugins.
+	$difference = ( false === $last_revision ) ? count( $total_plugins ) : $svn_last_revision - $last_revision;
 
-		if ( $return === 0 && file_exists( sprintf($download, $plugin) ) ) {
-			if ($type === 'all') {
-				if ( file_exists( 'plugins/' . $plugin ) )
-					exec( 'rm -rf ' . escapeshellarg( 'plugins/' . $plugin ) );
+	// Determine the batch total based on the difference.
+	$batch_total = ( $difference >= $per_batch ) ? $difference / $per_batch : 1;
 
-				exec( 'unzip -o -d plugins ' . escapeshellarg( 'zips/' . $plugin . '.zip' ) );
-				exec( 'rm -rf ' . escapeshellarg( 'zips/' . $plugin . '.zip' ) );
+	$plugins_count = 0;
+
+	/*
+	 * Display a message notifying that the plugins will be updated in batches.
+	 * Not shown for first-time pulls.
+	 */
+	if ( $batch_total > 1 && false !== $last_revision ) {
+		$display_diff = number_format( $difference );
+		echo "The number of revisions to update is $display_diff. Updating in batches.\r\n";
+	}
+
+	$current_batch = 1;
+
+	while( $current_batch <= $batch_total ) {
+		if ( $batch_total > 1 ) {
+
+			// Only increment the revision for batches 2+.
+			if ( $current_batch > 1 ) {
+				$temp_svn_last_revision = $temp_last_revision + $per_batch;
 			}
-		} else {
-			echo '... download failed.';
+
+			// Output batch message(s).
+			if ( false !== $last_revision ) {
+				// Updating from last revision.
+				printf( "\r\n" . 'Updating batch %1$s of %2$d at r%3$s' . "\r\n\r\n",
+					$current_batch,
+					ceil( $batch_total ),
+					$temp_svn_last_revision
+				);
+			} else {
+				// First-time pull.
+				printf( "\r\n" . 'Updating batch %1$s of %2$d' . "\r\n\r\n",
+					$current_batch,
+					ceil( $batch_total )
+				);
+			}
+
+			if ( false === $last_revision ) {
+				echo $current_batch . "\r\n";
+
+				$offset = $current_batch == 1 ? 0 : $per_batch * ( $current_batch - 1 );
+
+				echo $offset . "\r\n";
+				echo count( $total_plugins) . "\r\n";
+
+				$plugins = array_slice( $total_plugins, $offset, $per_batch );
+
+				echo count( $plugins) . "\r\n";
+			}
 		}
-		echo "\r\n";
+
+		// Get the current batch's plugins for updating based on revision.
+		if ( false !== $last_revision ) {
+			$limit         = $batch_total > 1 ? $per_batch : $difference;
+			$changelog_url = sprintf( 'http://plugins.trac.wordpress.org/log/?verbose=on&mode=follow_copy&format=changelog&rev=%d&limit=%d', $temp_svn_last_revision, $limit );
+			$changes       = file_get_contents( $changelog_url );
+
+			preg_match_all( '#^' . "\t" . '*\* ([^/A-Z ]+)[ /].* \((added|modified|deleted|moved|copied)\)' . "\n" . '#m', $changes, $matches );
+
+			$plugins = array_unique( $matches[1] );
+		}
+
+		// Update plugins.
+		foreach ( $plugins as $plugin ) {
+			$plugin = urldecode( $plugin );
+
+			echo "Updating " . $plugin;
+
+			$output = null; $return = null;
+			exec( 'wget -q -np -O ' . escapeshellarg( sprintf($download, $plugin) ) . ' ' . escapeshellarg( sprintf($url, $plugin) ) . ' > /dev/null', $output, $return );
+
+			if ( $return === 0 && file_exists( sprintf($download, $plugin) ) ) {
+				if ($type === 'all') {
+					if ( file_exists( 'plugins/' . $plugin ) )
+						exec( 'rm -rf ' . escapeshellarg( 'plugins/' . $plugin ) );
+
+					exec( 'unzip -o -d plugins ' . escapeshellarg( 'zips/' . $plugin . '.zip' ) );
+					exec( 'rm -rf ' . escapeshellarg( 'zips/' . $plugin . '.zip' ) );
+				}
+			} else {
+				echo '... download failed.';
+			}
+			echo "\r\n";
+		}
+
+		// Handle incrementing the last revision and current batch number for batches 2+.
+		if ( $batch_total > 1 ) {
+
+			/*
+			 * Print cleanup or error messages at the end of the current batch. Provides a closer
+			 * starting place for non-first-pull updates if for some reason it hangs while updating.
+			 */
+			if ( false === $last_revision || ( false !== $last_revision && $batch_total == 1 ) ) {
+				$new_revision = $svn_last_revision;
+			} else {
+				$new_revision = $temp_last_revision;
+			}
+
+			if ( false !== $last_revision ) {
+				if ( file_put_contents( $directory . '/.last-revision', $new_revision ) ) {
+					echo "[CLEANUP] Updated $directory/.last-revision to " . $new_revision . "\r\n";
+				} else {
+					echo "[ERROR] Could not update $directory/.last-revision to " . $new_revision . "\r\n";
+				}
+			}
+
+			// Increment the revision number for the next batch based on the $per_batch value.
+			if ( $batch_total > 1 && false !== $last_revision ) {
+				$temp_last_revision = $temp_last_revision + $per_batch;
+			}
+
+			// Increment the batch number.
+			$current_batch++;
+		}
+
+		// Add on the number of newly-updated plugins to the total count for the current batch.
+		$plugins_count = count( $plugins ) + $plugins_count;
 	}
 
-	if ( file_put_contents( $directory . '/.last-revision', $svn_last_revision ) )
-		echo "[CLEANUP] Updated $directory/.last-revision to " . $svn_last_revision . "\r\n";
-	else
-		echo "[ERROR] Could not update $directory/.last-revision to " . $svn_last_revision . "\r\n";
+	if ( false === $last_revision ) {
+		if ( file_put_contents( $directory . '/.last-revision', $new_revision ) ) {
+			echo "[CLEANUP] Updated $directory/.last-revision to " . $new_revision . "\r\n";
+		} else {
+			echo "[ERROR] Could not update $directory/.last-revision to " . $new_revision . "\r\n";
+		}
+	}
 }
 
 $end_time = time();
@@ -95,5 +211,5 @@ $minutes = ( $end_time - $start_time ) / 60;
 $seconds = ( $end_time - $start_time ) % 60;
 
 echo "[SUCCESS] Done updating plugins!\r\n";
-echo "It took " . number_format($minutes) . " minute" . ( $minutes == 1 ? '' : 's' ) . " and " . $seconds . " second" . ( $seconds == 1 ? '' : 's' ) . " to update ". count($plugins)  ." plugin" . ( count($plugins) == 1 ? '' : 's') . "\r\n";
+echo "It took " . number_format( $minutes ) . " minute" . ( $minutes == 1 ? '' : 's' ) . " and " . $seconds . " second" . ( $seconds == 1 ? '' : 's' ) . " to update ". $plugins_count  ." plugin" . ( $plugins_count == 1 ? '' : 's') . "\r\n";
 echo "[DONE]\r\n";
